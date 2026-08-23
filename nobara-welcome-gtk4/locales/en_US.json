@@ -22,6 +22,8 @@
     "open-codec-wizard-subtitle": "Install media codec packages required for video playback and encode/decode support.",
     "open-driver-manager-title": "Open Driver Manager",
     "open-driver-manager-subtitle": "A driver utility to install various driver such as the\nproprietary NVIDIA® drivers that significantly increase performance for NVIDIA cards \nand microcode for CPUs and such.",
+    "open-kernel-manager-title": "Open Nobara Kernel Manager",
+    "open-kernel-manager-subtitle": "Switch between Nobara Mainline and LTS kernels or reinstall the rescue kernel.",
     "open-drive-mount-manager-title": "Open Drive Mount Manager",
     "open-drive-mount-manager-subtitle": "Configure automatic mounting of disk/storage drives.",
     "open-software-manager-title": "Open Software Manager",

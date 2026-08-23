@@ -35,6 +35,15 @@
       "button": "launch-label",
       "terminal": false,
       "command": "/usr/bin/nobara-drive-mount-manager &"
+    },
+    {
+      "id": 4,
+      "title": "open-kernel-manager-title",
+      "subtitle": "open-kernel-manager-subtitle",
+      "icon": "com.github.cosmicfusion.nobara-kernel-manager",
+      "button": "launch-label",
+      "terminal": false,
+      "command": "/usr/lib/nobara/nobara-welcome/scripts/kernel-manager.sh &"
     }
   ]
 }
