@@ -244,20 +244,12 @@ class fp_user_installation_list(object):
 
 
     def __enter__(self):
-        flatpak_user_updates = None
-        error = True # No do-while in Python so init to true to run loop once
-        while error:
-            try:
-                flatpak_user_updates = self.user_installation.list_installed_refs_for_update(None)
-            except gi.repository.GLib.GError as e:
-                # Expected, see #43
-                self.log_queue.put(f"Error getting Flatpak user updates: {e}")
-            except:
-                raise
-            else:
-                error = False
-        return flatpak_user_updates
-    
+        try:
+            return self.user_installation.list_installed_refs_for_update(None)
+        except gi.repository.GLib.GError as e:
+            self.log_queue.put(f"Error getting Flatpak user updates: {e}")
+            return []
+
 
     def __exit__(self, *args):
         del self.user_installation

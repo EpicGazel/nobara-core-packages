@@ -1,8 +1,8 @@
 import json
 import logging
-import multiprocessing
 import os
 import pwd
+import queue
 import sys
 from pathlib import Path
 from typing import Any
@@ -48,9 +48,8 @@ def run_as_user_target(
     os.chdir(user_home)
 
     # Create the queues from the passed data
-    manager = multiprocessing.Manager()
-    log_queue = manager.Queue()
-    update_queue = manager.Queue()
+    log_queue: queue.Queue[Any] = queue.Queue()
+    update_queue: queue.Queue[Any] = queue.Queue()
 
     for item in log_queue_data:
         log_queue.put(item)

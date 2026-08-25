@@ -44,10 +44,6 @@ if "ORIGINAL_USER_HOME" in os.environ:
     original_user_home = Path(os.environ["ORIGINAL_USER_HOME"])
 
 log_file_path = original_user_home / ".local/share/nobara-updater/"
-
-if not log_file_path.exists():
-    log_file_path.mkdir(parents=True)
-
 log_file = log_file_path / "nobara-sync.log"
 
 class Color:
@@ -123,6 +119,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 
+def prepare_logging_directory() -> None:
+    log_file_path.mkdir(parents=True, exist_ok=True)
+
+
 def initialize_logging(textview: Gtk.TextView = None) -> logging.Logger:
     global rotate_log_files
     global logger
@@ -143,6 +143,10 @@ def initialize_logging(textview: Gtk.TextView = None) -> logging.Logger:
     logger.addHandler(console_handler)
 
     # LOG FILE
+    # Do not create this directory at module import time. Python's forkserver
+    # imports the main module in helper processes, which can otherwise create
+    # paths in the original user's home while still running as root.
+    prepare_logging_directory()
     # Rotate log files before writing the new log fo;e
     rotate_log_files(str(log_file))
 
@@ -176,6 +180,64 @@ def is_running_with_sudo_or_pkexec() -> int:
         return 2
 
     return 0
+
+
+def _uid_from_home(home: str | None) -> int | None:
+    if not home:
+        return None
+    try:
+        home_path = Path(home).expanduser().resolve()
+    except Exception:
+        return None
+    if home_path == Path("/root"):
+        return None
+    for pw_record in pwd.getpwall():
+        try:
+            if Path(pw_record.pw_dir).resolve() == home_path and pw_record.pw_uid != 0:
+                return pw_record.pw_uid
+        except Exception:
+            continue
+    return None
+
+
+def _set_original_user_env(uid: int) -> tuple[int, int]:
+    pw_record = pwd.getpwuid(uid)
+    os.environ["ORIG_USER"] = str(uid)
+    os.environ["ORIGINAL_USER_HOME"] = pw_record.pw_dir
+    return uid, pw_record.pw_gid
+
+
+def resolve_original_user_ids() -> tuple[int, int]:
+    candidates: list[int] = []
+    for env_name in ("ORIG_USER", "PKEXEC_UID", "SUDO_UID"):
+        value = os.environ.get(env_name)
+        if value and value.isdigit():
+            candidates.append(int(value))
+
+    sudo_user = os.environ.get("SUDO_USER", "")
+    if sudo_user:
+        if sudo_user.isdigit():
+            candidates.append(int(sudo_user))
+        else:
+            try:
+                candidates.append(pwd.getpwnam(sudo_user).pw_uid)
+            except KeyError:
+                print(f"User {sudo_user} not found")
+
+    for home_env in ("ORIGINAL_USER_HOME", "HOME"):
+        uid = _uid_from_home(os.environ.get(home_env))
+        if uid is not None:
+            candidates.append(uid)
+
+    for uid in candidates:
+        if uid != 0:
+            return _set_original_user_env(uid)
+
+    if os.geteuid() != 0:
+        return _set_original_user_env(os.getuid())
+
+    pw_record = pwd.getpwuid(0)
+    return 0, pw_record.pw_gid
 
 
 # Read VERSION_ID from /etc/os-release
@@ -421,6 +483,8 @@ def check_repos() -> None:
 
 
 updates_available = 0
+system_updates_available = 0
+flatpak_updates_available = 0
 fixups_available = 0
 perform_kernel_actions = 0
 perform_reboot_request = 0
@@ -453,7 +517,9 @@ def get_fixups_available() -> int:
     global fixups_available
     return fixups_available
 
-def check_updates(return_texts: bool = False) -> None | tuple[str | None, str | None, str | None]:
+def check_updates(
+    return_texts: bool = False, *, include_flatpaks: bool = True
+) -> None | tuple[str | None, str | None, str | None]:
     global updates_available
     global system_updates_available
     global flatpak_updates_available
@@ -473,44 +539,29 @@ def check_updates(return_texts: bool = False) -> None | tuple[str | None, str | 
         system_updates_available = 1
         sys_update_text = "\n".join(package_names)
 
-    if is_running_with_sudo_or_pkexec() == 1:
-        sudo_user = os.environ.get('SUDO_USER', '')
-        if sudo_user and not sudo_user.isdigit():
-            try:
-                orig_user_uid = pwd.getpwnam(sudo_user).pw_uid
-                os.environ['ORIG_USER'] = str(orig_user_uid)
+    if include_flatpaks:
+        orig_user_uid, orig_user_gid = resolve_original_user_ids()
 
-                original_user_home = pwd.getpwnam(sudo_user).pw_dir
-                os.environ['ORIGINAL_USER_HOME'] = str(original_user_home)
-            except KeyError:
-                print(f"User {sudo_user} not found")
+        # Flatpak User Updates window
+        fp_user_updates = run_as_user(
+            orig_user_uid, orig_user_gid, "fp_get_user_updates"
+        )
+        if fp_user_updates:
+            updates_available = 1
+            flatpak_updates_available = 1
+            fp_user_update_text = "\n".join(fp_user_updates)
 
-    # Get the original user's UID and GID
-    orig_user = os.environ.get("ORIG_USER")
-    if orig_user is None:
-        orig_user = "0"
-    orig_user_uid = int(orig_user)
-    pw_record = pwd.getpwuid(orig_user_uid)
-    orig_user_gid = pw_record.pw_gid
-
-    # Flatpak User Updates window
-    fp_user_updates = run_as_user(orig_user_uid, orig_user_gid, "fp_get_user_updates")
-    if fp_user_updates:
-        updates_available = 1
-        flatpak_updates_available = 1
-        fp_user_update_text = "\n".join(fp_user_updates)
-
-    # Flatpak System Updates window
-    fp_system_updates = fp_get_system_updates()
-    if fp_system_updates:
-        updates_available = 1
-        flatpak_updates_available = 1
-        fp_sys_update_texts = [
-            fp_system_update.get_appdata_name()
-            for fp_system_update in fp_system_updates
-            if fp_system_update.get_appdata_name() is not None
-        ]
-        fp_sys_update_text = "\n".join(fp_sys_update_texts)
+        # Flatpak System Updates window
+        fp_system_updates = fp_get_system_updates()
+        if fp_system_updates:
+            updates_available = 1
+            flatpak_updates_available = 1
+            fp_sys_update_texts = [
+                fp_system_update.get_appdata_name()
+                for fp_system_update in fp_system_updates
+                if fp_system_update.get_appdata_name() is not None
+            ]
+            fp_sys_update_text = "\n".join(fp_sys_update_texts)
 
     if is_running_with_sudo_or_pkexec() == 1:
         if sys_update_text:
@@ -539,22 +590,7 @@ def fp_get_system_updates() -> list[Flatpak.Ref] | None:
         return []
 
 def get_orig_user_ids() -> tuple[int, int]:
-    if is_running_with_sudo_or_pkexec() == 1:
-        sudo_user = os.environ.get("SUDO_USER", "")
-        if sudo_user and not sudo_user.isdigit():
-            try:
-                orig_user_uid = pwd.getpwnam(sudo_user).pw_uid
-                os.environ["ORIG_USER"] = str(orig_user_uid)
-                original_user_home = pwd.getpwnam(sudo_user).pw_dir
-                os.environ["ORIGINAL_USER_HOME"] = str(original_user_home)
-            except KeyError:
-                print(f"User {sudo_user} not found")
-
-    orig_user = os.environ.get("ORIG_USER") or "0"
-    orig_user_uid = int(orig_user)
-    pw_record = pwd.getpwuid(orig_user_uid)
-    orig_user_gid = pw_record.pw_gid
-    return orig_user_uid, orig_user_gid
+    return resolve_original_user_ids()
 
 #return False if uki is detected based on bootctl. Return True in cases where calls fail or image_type is split.
 #primarily to avoid crash later
@@ -598,7 +634,7 @@ def install_system_updates_only() -> bool:
             logger.error("DNF System Updates failed!")
 
     # Perform dracut if kernel was updated.
-    if perform_kernel_actions == 1:
+    if success and perform_kernel_actions == 1:
         supported = kernel_image_supported()
         if supported:
             logger.info(
@@ -629,6 +665,8 @@ def install_system_updates_only() -> bool:
 
             subprocess.run(["dracut", "-f", "--regenerate-all"], check=True)
         perform_reboot_request = 1
+    elif not success:
+        logger.info("Skipping post-update kernel/reboot actions because system package updates failed.")
 
     # Send update refresh request to systray service
     orig_user_uid, orig_user_gid = get_orig_user_ids()
@@ -641,9 +679,11 @@ def install_system_updates_only() -> bool:
         except OSError as e:
             logger.error("Error: %s", e.strerror)
 
-    if perform_reboot_request == 1:
+    if success and perform_reboot_request == 1:
         logger.info("Kernel, kernel module, or desktop compositor update performed. Reboot required.")
         prompt_reboot()
+    elif not success and perform_reboot_request == 1:
+        logger.info("Skipping reboot request because system package updates failed.")
 
     return success
 
@@ -690,19 +730,11 @@ class fp_system_installation_list(object):
 
 
     def __enter__(self):
-        flatpak_system_updates = None
-        error = True # No do-while in Python so init to true to run loop once
-        while error:
-            try:
-                flatpak_system_updates = self.system_installation.list_installed_refs_for_update(None)
-            except gi.repository.GLib.GError as e:
-                # Expected, see #43
-                logger.error(e)
-            except:
-                raise
-            else:
-                error = False
-        return flatpak_system_updates
+        try:
+            return self.system_installation.list_installed_refs_for_update(None)
+        except gi.repository.GLib.GError as e:
+            logger.error("Error getting Flatpak system updates: %s", e)
+            return []
 
 
     def __exit__(self, *args):
@@ -751,30 +783,9 @@ def install_fixups() -> None:
         logger.info("Problems with Media Packages detected, repairing...")
         prompt_media_fixup()
 
-    if is_running_with_sudo_or_pkexec() == 1:
-        sudo_user = os.environ.get('SUDO_USER', '')
-        if sudo_user and not sudo_user.isdigit():
-            try:
-                orig_user_uid = pwd.getpwnam(sudo_user).pw_uid
-                os.environ['ORIG_USER'] = str(orig_user_uid)
-
-                original_user_home = pwd.getpwnam(sudo_user).pw_dir
-                os.environ['ORIGINAL_USER_HOME'] = str(original_user_home)
-            except KeyError:
-                print(f"User {sudo_user} not found")
-
-    # Get the original user's UID and GID
-    orig_user = os.environ.get("ORIG_USER")
-    if orig_user is None:
-        orig_user = "0"
-    orig_user_uid = int(orig_user)
-    pw_record = pwd.getpwuid(orig_user_uid)
-    orig_user_gid = pw_record.pw_gid
-
     # Send update refresh request to systray service
-    run_as_user(
-        orig_user_uid, orig_user_gid, "yumex_sync_updates"
-    )
+    orig_user_uid, orig_user_gid = get_orig_user_ids()
+    run_as_user(orig_user_uid, orig_user_gid, "yumex_sync_updates")
 
 
 def install_updates() -> bool:
@@ -1147,11 +1158,16 @@ def check_root_privileges(args: Namespace) -> None:
             logger.info(f"Error: {e}")
             sys.exit(1)
 
+    if os.geteuid() == 0:
+        resolve_original_user_ids()
+        return
+
     if is_running_with_sudo_or_pkexec() == 0:
         # Relaunch the script with pkexec or sudo
         script_path = Path(__file__).resolve()
         if "DISPLAY" not in os.environ or args.command is not None:
-            ouid = os.getuid()
+            ouid, _ogid = resolve_original_user_ids()
+            original_home = pwd.getpwuid(ouid).pw_dir
             os.execvp(
                 "sudo",
                 [
@@ -1159,7 +1175,7 @@ def check_root_privileges(args: Namespace) -> None:
                     "-E",
                     "env",
                     f"XAUTHORITY={os.environ.get('XAUTHORITY', '')}",
-                    f"ORIGINAL_USER_HOME={Path('~').expanduser()!s}",
+                    f"ORIGINAL_USER_HOME={original_home}",
                     f"ORIG_USER={int(ouid)}",
                     f"SUDO_USER={int(ouid)}",
                     sys.executable,
@@ -1168,6 +1184,8 @@ def check_root_privileges(args: Namespace) -> None:
                 + sys.argv[1:],
             )
         else:
+            ouid, _ogid = resolve_original_user_ids()
+            original_home = pwd.getpwuid(ouid).pw_dir
             try:
                 subprocess.run(["xhost", "si:localuser:root"],
                 check=True,
@@ -1185,9 +1203,9 @@ def check_root_privileges(args: Namespace) -> None:
                     f"DISPLAY={os.environ['DISPLAY']}",
                     f"XAUTHORITY={os.environ.get('XAUTHORITY', '')}",
                     f"XDG_CURRENT_DESKTOP={os.environ.get('XDG_CURRENT_DESKTOP', '').lower()}",
-                    f"ORIGINAL_USER_HOME={Path('~').expanduser()!s}",
-                    f"ORIG_USER={os.getuid()!s}",
-                    f"PKEXEC_UID={os.getuid()!s}",
+                    f"ORIGINAL_USER_HOME={original_home}",
+                    f"ORIG_USER={ouid!s}",
+                    f"PKEXEC_UID={ouid!s}",
                     "NO_AT_BRIDGE=1",
                     "G_MESSAGES_DEBUG=none",
                     sys.executable,
@@ -1195,19 +1213,17 @@ def check_root_privileges(args: Namespace) -> None:
                 ]
                 + sys.argv[1:],
             )
-def request_update_status() -> None:
-    global updates_available
-    global fixups_available
-    have_updates = 0
-
-    if updates_available == 1:
-        have_updates = 1
-        logger.info("Updates Available.")
+def request_update_status(include_flatpaks: bool = True) -> None:
+    if system_updates_available == 1:
+        logger.info("System updates available.")
     else:
-        logger.info("No Updates Available.")
+        logger.info("System updates complete.")
 
-    if have_updates != 1:
-        logger.info("All Updates complete!")
+    if include_flatpaks:
+        if flatpak_updates_available == 1:
+            logger.info("Flatpak updates available.")
+        else:
+            logger.info("Flatpak updates complete.")
 
 def cleanup_xhost():
     """Cleanup function to run xhost on exit"""
@@ -1226,6 +1242,9 @@ def main() -> None:
 
     args = parse_args()
     check_manual_sudo()
+    # Create the log directory before self-elevation so a normal user launch
+    # cannot leave root-owned .local/share directories behind.
+    prepare_logging_directory()
     check_root_privileges(args)
 
     if args.command and os.geteuid() == 0:
@@ -1257,15 +1276,15 @@ def main() -> None:
             exit(0 if success else 1)
         if args.command == "cli":
             check_repos()
-            check_updates()
+            check_updates(include_flatpaks=args.all)
             install_fixups()
             success = install_system_updates_only()
 
             if args.all:
                 install_flatpak_updates_only()
 
-            check_updates()
-            request_update_status()
+            check_updates(include_flatpaks=args.all)
+            request_update_status(include_flatpaks=args.all)
             exit(0 if success else 1)
         if args.command == "install-codecs":
             prompt_media_fixup()
@@ -1315,23 +1334,10 @@ class UpdateWindow(Gtk.Window):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__(title="Update System")
         if os.geteuid() == 0:
-            if is_running_with_sudo_or_pkexec() == 1:
-                sudo_user = os.environ.get('SUDO_USER', '')
-                if sudo_user and not sudo_user.isdigit():
-                    try:
-                        orig_user_uid = pwd.getpwnam(sudo_user).pw_uid
-                        os.environ['ORIG_USER'] = str(orig_user_uid)
-
-                        original_user_home = pwd.getpwnam(sudo_user).pw_dir
-                        os.environ['ORIGINAL_USER_HOME'] = str(original_user_home)
-                    except KeyError:
-                        print(f"User {sudo_user} not found")
-
             # Get the original user's UID and GID to pass to root mode
-            self.orig_user = os.environ.get("ORIG_USER")
-            self.orig_user_uid = os.getuid() if self.orig_user is None else int(self.orig_user)
+            self.orig_user_uid, self.orig_user_gid = resolve_original_user_ids()
+            self.orig_user = str(self.orig_user_uid)
             self.pw_record = pwd.getpwuid(self.orig_user_uid)
-            self.orig_user_gid = self.pw_record.pw_gid
             self.perform_kernel_actions = perform_kernel_actions
             self.perform_reboot_request = perform_reboot_request
             self.fp_system_updates: list[Flatpak.Ref] | None = None

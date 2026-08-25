@@ -138,6 +138,26 @@ def _add_resolvable_installonly_upgrades(
         if any(True for _ in query):
             goal.add_upgrade(name)
 
+
+def _expire_enabled_repositories(
+    base: dnf5_base.Base, log: logging.Logger | None = None
+) -> None:
+    expired_repo_ids = []
+    for repo in dnf5_repo.RepoQuery(base):
+        try:
+            enabled = repo.get_config().get_enabled_option().get_value()
+        except (OptionValueNotSetError, RuntimeError, AttributeError):
+            enabled = False
+        if not enabled:
+            continue
+        repo.expire()
+        expired_repo_ids.append(repo.get_id())
+
+    if log is not None and expired_repo_ids:
+        log.info("Refreshing repository metadata before resolving transaction...")
+        log.debug("Expired repositories: %s", ", ".join(expired_repo_ids))
+
+
 def updatechecker(retries: int = 3, delay: int = 5) -> list[str]:
     attempt = 0
     while attempt < retries:
@@ -279,6 +299,41 @@ def _transaction_has_errors(transaction, logger: logging.Logger) -> bool:
     return has_errors
 
 
+def _log_transaction_failure_details(
+    transaction, logger: logging.Logger, log_generic_fallback: bool = True
+) -> None:
+    logged_details = False
+
+    for getter_name in (
+        "get_transaction_problems",
+        "get_gpg_signature_problems",
+        "get_problems",
+    ):
+        getter = getattr(transaction, getter_name, None)
+        if getter is None:
+            continue
+        try:
+            problems = list(getter() or [])
+        except Exception as e:
+            logger.debug("Could not read %s: %s", getter_name, e)
+            continue
+        for problem in problems:
+            problem_text = str(problem)
+            if "NO_PROBLEM" in problem_text:
+                continue
+            logger.error("%s: %s", getter_name, problem_text)
+            logged_details = True
+
+    if _transaction_has_errors(transaction, logger):
+        logged_details = True
+
+    if not logged_details and log_generic_fallback:
+        logger.error(
+            "libdnf5 did not provide package-specific failure details. "
+            "Try rerunning with `dnf5 upgrade --downloadonly --refresh` to identify the failed package or mirror."
+        )
+
+
 def _log_transaction_packages(transaction, logger: logging.Logger) -> None:
     packages = transaction.get_transaction_packages()
     total = transaction.get_transaction_packages_count()
@@ -296,6 +351,53 @@ def _log_transaction_packages(transaction, logger: logging.Logger) -> None:
         }.get(item.get_action(), "Processing")
 
         logger.info("    (%s/%s) %s %s", index, total, action, package.get_nevra())
+
+
+class _DownloadCallbacks(dnf5_repo.DownloadCallbacks):
+    """Capture package download failures reported through libdnf5/librepo."""
+
+    def __init__(self, logger: logging.Logger) -> None:
+        super().__init__()
+        self.logger = logger
+        self.had_failure = False
+        self._download_labels: dict[str, str] = {}
+        self._mirror_failures: dict[str, list[str]] = {}
+
+    def add_new_download(self, user_data, description: str, total_to_download: float):
+        self._download_labels[str(user_data)] = (
+            str(description) if description else str(user_data)
+        )
+        return user_data
+
+    def _download_label(self, user_cb_data) -> str:
+        return self._download_labels.get(str(user_cb_data), str(user_cb_data))
+
+    def progress(
+        self, user_cb_data, total_to_download: float, downloaded: float
+    ) -> int:
+        return self.OK
+
+    def mirror_failure(self, user_cb_data, msg: str, url: str, metadata: str) -> int:
+        label = self._download_label(user_cb_data)
+        detail = f"{url}: {msg}" if url else msg
+        if metadata:
+            detail = f"{metadata}: {detail}"
+        self._mirror_failures.setdefault(label, []).append(detail)
+        return self.OK
+
+    def end(self, user_cb_data, status: int, msg: str) -> int:
+        if status == self.TransferStatus_ERROR:
+            self.had_failure = True
+            label = self._download_label(user_cb_data)
+            self.logger.error(
+                "Download failed for %s: %s", label, msg or "unknown error"
+            )
+            for failure in self._mirror_failures.get(label, [])[-3:]:
+                self.logger.error("    Mirror failure: %s", failure)
+        return self.OK
+
+    def fastest_mirror(self, user_cb_data, stage: int, ptr: str) -> int:
+        return self.OK
 
 
 def _format_nevra(nevra) -> str:
@@ -363,6 +465,8 @@ class _UpgradeTransactionCallbacks(dnf5_rpm.TransactionCallbacks):
 def run_system_upgrade_transaction(logger: logging.Logger | None = None) -> bool:
     tx_logger = logger if logger is not None else logging.getLogger()
     base = dnf5_base.Base()
+    download_callbacks = None
+    download_callbacks_ptr = None
 
     try:
         config = base.get_config()
@@ -371,9 +475,13 @@ def run_system_upgrade_transaction(logger: logging.Logger | None = None) -> bool
 
         base.load_config()
         base.setup()
+        download_callbacks = _DownloadCallbacks(tx_logger)
+        download_callbacks_ptr = dnf5_repo.DownloadCallbacksUniquePtr(download_callbacks)
+        base.set_download_callbacks(download_callbacks_ptr)
 
         sack = base.get_repo_sack()
         sack.create_repos_from_system_configuration()
+        _expire_enabled_repositories(base, tx_logger)
         sack.load_repos()
 
         goal = dnf5_base.Goal(base)
@@ -402,7 +510,19 @@ def run_system_upgrade_transaction(logger: logging.Logger | None = None) -> bool
         _log_transaction_packages(transaction, tx_logger)
 
         tx_logger.info("Downloading packages...")
-        transaction.download()
+        try:
+            transaction.download()
+        except Exception as e:
+            download_failure_logged = bool(
+                download_callbacks is not None and download_callbacks.had_failure
+            )
+            tx_logger.error("DNF package download failed: %s", e)
+            _log_transaction_failure_details(
+                transaction,
+                tx_logger,
+                log_generic_fallback=not download_failure_logged,
+            )
+            return False
 
         tx_logger.info("Running transaction...")
         # Keep the Python SWIG director alive until transaction.run() returns.
