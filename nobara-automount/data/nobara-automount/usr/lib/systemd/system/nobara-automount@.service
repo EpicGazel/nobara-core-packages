@@ -1,7 +1,11 @@
 [Unit]
 Description=Nobara automount manager for %I
-PartOf=%i.mount
-After=%i.mount
+# The instance is already the escaped mount unit name, including ".mount".
+# Propagate stops in both directions and let PID 1 own the unmount job. Calling
+# systemd-umount synchronously from ExecStop can deadlock during shutdown: the
+# client waits for the mount stop job while PID 1 waits for this service to stop.
+PartOf=%i
+PropagatesStopTo=%i
 
 [Service]
 Type=oneshot
@@ -21,10 +25,9 @@ ExecStart=/usr/bin/systemd-mount --no-block --type "${FSTYPE}" --options "${OPTS
 # Do your post-mount work (create shortcut, etc.)
 ExecStartPost=/usr/libexec/nobara-automount --mount --uuid "${UUID}" --fstype "${FSTYPE}"
 
-ExecStop=/usr/bin/systemd-umount "/run/media/${RWUSER}/${UUID}"
-
-# On stop (manual umount or toggle-off), systemd stops this service due to PartOf=%i.
-# Cleanly unmount and cleanup:
+# Whether the service or mount is stopped first, the corresponding stop is
+# propagated by the unit dependencies above. Remove per-user artifacts after
+# this service has stopped.
 ExecStopPost=/usr/libexec/nobara-automount --cleanup --uuid "${UUID}"
 
 [Install]
