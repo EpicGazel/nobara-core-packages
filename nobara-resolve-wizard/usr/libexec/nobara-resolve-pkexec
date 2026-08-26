@@ -4,67 +4,81 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-import shutil
-import stat
 
-LIBDIR = Path("/opt/resolve/libs")
-RUNTIME_DIR = Path("/opt/nobara-resolve-runtime")
 
-# Check if the correct number of arguments were provided
-if len(sys.argv) != 2:
-    print("Usage: python script.py <run_file>")
-    sys.exit(1)
+PCI_DEVICES_PATH = Path("/sys/bus/pci/devices")
+AMD_PCI_VENDOR_ID = 0x1002
+DISPLAY_CONTROLLER_BASE_CLASS = 0x03
+BASE_PACKAGES = (
+    # zlib-ng-compat supplies the ABI and now pulls in Nobara's noarch "zlib"
+    # package-name shim for third-party installers that query RPM names.
+    "zlib-ng-compat",
+    "libxcrypt-compat",
+    "alsa-plugins-pulseaudio",
+)
 
-run_file = sys.argv[1]
 
-# Step 1: Install necessary packages as root
-subprocess.run(["dnf", "install", "-y", "rocm-meta", "nobara-resolve-runtime", "zlib", "libxcrypt-compat", "python3.11", "python3.11-libs", "alsa-plugins-pulseaudio"], check=True)
-
-# Step 2: Remove old version if it exists
-os.chmod(run_file, 0o775)
-subprocess.run(["bash", "-c", f"SKIP_PACKAGE_CHECK=1 {run_file} -u -y -a"], check=True)
-
-# Step 3: Run the .run file as the user
-subprocess.run(["bash", "-c", f"SKIP_PACKAGE_CHECK=1 {run_file} -i -r -y -a"], check=True)
-
-# Step 4: Fix broken resolve-shipped libraries
-# Remove the resolve-shipped libs that conflict
-for pattern in ("libglib-*", "libgobject-*", "libgmodule-*", "libgio-*"):
-    for p in LIBDIR.glob(pattern):
-        try:
-            if p.is_dir():
-                shutil.rmtree(p)  # just in case a directory matches
-            else:
-                p.unlink()
-        except FileNotFoundError:
-            pass  # already gone
-        except PermissionError as e:
-            print(f"Permission error removing {p}: {e}")
-
-# Copy the system-provided .so.* files into Resolve's lib directory
-for sofile in RUNTIME_DIR.glob("*.so.*"):
+def _read_sysfs_hex(path: Path) -> int | None:
     try:
-        shutil.copy2(sofile, LIBDIR / sofile.name)
-    except PermissionError as e:
-        print(f"Permission error copying {sofile}: {e}")
+        return int(path.read_text(encoding="ascii").strip(), 0)
+    except (OSError, ValueError):
+        return None
 
-# Paths
-orig = "/opt/resolve/bin/resolve"
-real = "/opt/resolve/bin/resolve-real"
 
-# 1. Move original binary to resolve-real
-shutil.move(orig, real)
+def has_amd_gpu(pci_devices_path: Path = PCI_DEVICES_PATH) -> bool:
+    """Return whether PCI sysfs contains an AMD display controller."""
 
-# 2. Create the wrapper script
-wrapper_content = """#!/bin/bash
-export RUSTICL_ENABLE=""
-export LD_PRELOAD=/usr/lib64/libpython3.11.so.1.0
-exec /opt/resolve/bin/resolve-real "$@"
-"""
+    try:
+        devices = pci_devices_path.iterdir()
+        for device in devices:
+            vendor_id = _read_sysfs_hex(device / "vendor")
+            device_class = _read_sysfs_hex(device / "class")
+            if (
+                vendor_id == AMD_PCI_VENDOR_ID
+                and device_class is not None
+                and device_class >> 16 == DISPLAY_CONTROLLER_BASE_CLASS
+            ):
+                return True
+    except OSError:
+        pass
+    return False
 
-with open(orig, "w") as f:
-    f.write(wrapper_content)
 
-# 3. Make the wrapper executable (chmod +x)
-st = os.stat(orig)
-os.chmod(orig, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+def required_packages(amd_gpu_present: bool) -> tuple[str, ...]:
+    if amd_gpu_present:
+        return ("rocm-meta", *BASE_PACKAGES)
+    return BASE_PACKAGES
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = sys.argv if argv is None else argv
+    if len(args) != 2:
+        print(f"Usage: {args[0]} <run_file>", file=sys.stderr)
+        return 1
+
+    run_file = str(Path(args[1]).resolve())
+    amd_gpu_present = has_amd_gpu()
+    if amd_gpu_present:
+        print("AMD GPU detected; installing ROCm support.")
+    else:
+        print("No AMD GPU detected; skipping ROCm support.")
+
+    subprocess.run(
+        ["dnf", "install", "-y", *required_packages(amd_gpu_present)],
+        check=True,
+    )
+
+    os.chmod(run_file, 0o775)
+    subprocess.run(
+        [run_file, "-u", "-y", "-a"],
+        check=True,
+    )
+    subprocess.run(
+        [run_file, "-i", "-r", "-y", "-a"],
+        check=True,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
