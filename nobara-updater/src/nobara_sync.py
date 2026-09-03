@@ -1293,6 +1293,7 @@ def check_root_privileges(args: Namespace) -> None:
                     f"ORIGINAL_USER_HOME={original_home}",
                     f"ORIG_USER={int(ouid)}",
                     f"SUDO_USER={int(ouid)}",
+                    f"XHOST_GRANTED=0",
                     sys.executable,
                     str(script_path),
                 ]
@@ -1301,12 +1302,14 @@ def check_root_privileges(args: Namespace) -> None:
         else:
             ouid, _ogid = resolve_original_user_ids()
             original_home = pwd.getpwuid(ouid).pw_dir
+            xhost_granted = "0"
             try:
                 subprocess.run(["xhost", "si:localuser:root"],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
                 )
+                xhost_granted = "1"
             except Exception:
                 pass
             os.execvp(
@@ -1321,6 +1324,7 @@ def check_root_privileges(args: Namespace) -> None:
                     f"ORIGINAL_USER_HOME={original_home}",
                     f"ORIG_USER={ouid!s}",
                     f"PKEXEC_UID={ouid!s}",
+                    f"XHOST_GRANTED={xhost_granted}",
                     "NO_AT_BRIDGE=1",
                     "G_MESSAGES_DEBUG=none",
                     sys.executable,
@@ -1342,8 +1346,7 @@ def request_update_status(include_flatpaks: bool = True) -> None:
 
 def cleanup_xhost():
     """Cleanup function to run xhost on exit"""
-    args = parse_args()
-    if "DISPLAY" not in os.environ or args.command is not None:
+    if os.environ.get("XHOST_GRANTED") == "1":
         try:
             subprocess.run(["xhost", "-si:localuser:root"],
             check=True,
